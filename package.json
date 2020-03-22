@@ -1,0 +1,19 @@
+{
+  "name": "video-cut-tool-video-worker",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start:dev": "nodemon index.js",
+    "start:prod": "pm2 start --name cut-tool-worker index.js",
+    "stop:prod": "pm2 stop cut-tool-worker "
+  },
+  "author": "Hassan Amin",
+  "license": "ISC",
+  "dependencies": {
+    "async": "^3.1.1",
+    "bull": "^3.13.0",
+    "superagent": "^5.2.2"
+  }
+}
