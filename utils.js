@@ -309,7 +309,7 @@ function removeAudioFromVideos(videosPaths, videoDuration, currentTimecode, call
 			const clearedLocation = path.join(__dirname, `cleared-video-${Date.now()}.${videoExtension}`);
 			clearedLocations.push(clearedLocation);
 
-			const cmd = spawn('ffmpeg', ['-i', videoPath, '-an', clearedLocation]);
+			const cmd = spawn('ffmpeg', ['-i', videoPath, '-c', 'copy', '-an', clearedLocation]);
 
 			const timeRegExp = new RegExp(/time=(\d{2}:\d{2}:\d{2}.\d{2})/);
 
