@@ -1,403 +1,361 @@
+// ffmpeg -i origin.webm  -c:a copy -an -vf "transpose=2,transpose=2, crop=600:200:50:100" dest.webm
 const fs = require('fs');
+const fsPromise = require('fs').promises;
 const path = require('path');
-const async = require('async');
+const { spawn } = require('child_process');
+const superagent = require('superagent');
+const config = require('./config')();
 
-const { exec, spawn } = require('child_process');
+const { API_ROOT } = config;
 
-// const eventEmitter = require('../eventEmitter');
-
-function convertTimeToMs(timeArr) {
-	let hour = timeArr[0] * 60 * 60 * 1000;
-	let minute = timeArr[1] * 60 * 1000;
-	let sec = timeArr[2].split('.')[0] * 1000;
-	let ms = timeArr[2].split('.')[1] * 10;
+/**
+ * Convert time to milliseconds
+ *
+ * @param {string} time The time string to convert to ms
+ * @returns {string} Converted time string
+ */
+function convertTimeToMs(time) {
+	const timeArr = time.split(':');
+	const hour = timeArr[0] * 60 * 60 * 1000;
+	const minute = timeArr[1] * 60 * 1000;
+	const sec = timeArr[2].split('.')[0] * 1000;
+	const ms = timeArr[2].split('.')[1] * 10;
 
 	return hour + minute + sec + ms;
 }
 
-// function updateProgressEmit(current, total, task) {
-// 	eventEmitter.emit(
-// 		'progress:update', 
-// 		JSON.stringify({
-// 			duration: total,
-// 			time: current,
-// 			currentTask: task
-// 		})
-// 	);
-// }
-
-function move(oldPath, newPath, callback) {
-    fs.rename(oldPath, newPath, function (err) {
-        if (err) {
-            if (err.code === 'EXDEV') {
-                copy();
-            } else {
-                callback(err);
-            }
-            return;
-        }
-        callback();
-    });
-
-    function copy() {
-        var readStream = fs.createReadStream(oldPath);
-        var writeStream = fs.createWriteStream(newPath);
-
-        readStream.on('error', callback);
-        writeStream.on('error', callback);
-
-        readStream.on('close', function () {
-            fs.unlink(oldPath, callback);
-        });
-
-        readStream.pipe(writeStream);
-    }
-}
-
-function moveVideosToPublic(videoPaths, callback) {
-    const moveFuncArray = [];
-	const newPaths = [];
-	const currentDate = Date.now();
-    videoPaths.forEach((video,index) => {
-        moveFuncArray.push((cb) => {
-			const videoName = `${currentDate}-${index}.${video.split('.').pop()}`;
-            const newPath = path.join(__dirname, '../', 'public', `publicVideo-${videoName}`);
-            newPaths.push(newPath);
-            move(video, newPath, (err) => {
-                if (err) return cb(err);      
-                return cb();
-            })
-        })
-    });
-    async.parallel(moveFuncArray, (err) => {
-        if (err) return callback(err);
-        return callback(null, newPaths);
-    })
-}
-
+/**
+ * Delete files
+ * @param {array|string} files Array of files paths or file path string to delete
+ */
 function deleteFiles(files) {
-	files.forEach((file) => {
-		fs.unlink(file, () => { });
-	})
-}
-
-function downloadVideo(url, name, callback) {
-	if ( name == null ){
-		name = url;
+	if (!Array.isArray(files)) {
+		fs.unlink(files, () => {});
+		return;
 	}
-	let videoExtension = name.split('.').pop().toLowerCase();
-	var videoDownloadPath = path.join(__dirname,`video_${Date.now()}_${parseInt(Math.random() * 10000)}` + '.' + videoExtension);
-	var cmd = `ffmpeg -y -i "${url}" -vcodec copy -acodec copy "${videoDownloadPath}"`
-	exec(cmd, (err, stderr, stdout) => {
-		console.error(err)
-		if (err) return callback(err);
-		console.log("downloading success")
-
-		const durationRegExp = new RegExp(/Duration: (\d{2}:\d{2}:\d{2}.\d{2})/);
-		let videoDuration = convertTimeToMs(stdout.match(durationRegExp)[1].split(':'));
-
-		return callback(null, videoDownloadPath, videoDuration);
-	})
+	files.forEach(file => {
+		fs.unlink(file, () => {});
+	});
 }
 
-function trimVideos(videoPath, taskNum, trims, mode, callback) {
-	const trimFuncArray = [];
+/**
+ * Spawn function warpped in Promise object
+ *
+ * @param {array} args Array of ffmpeg flags
+ * @param {string} stage Current processing stage
+ * @param {int} videoId Video ID
+ * @param {obj} resolveObj Object to pass to resolve callback
+ * @param {obj} trimDuration Object to calculate trim duration. Used for trimming stage
+ * @returns {obj} A reject or resolve promise
+ */
+function spawnAsyn(args, stage, videoId, resolveObj = {}, trimDuration = {}) {
+	return new Promise((resolve, reject) => {
+		const cmd = spawn('ffmpeg', args);
+		let duration = null;
+		const durationRegExp = new RegExp(/Duration\s+:\s+(\d{2}:\d{2}:\d{2}.\d{2})/, 'gim');
+		cmd.stderr.on('data', chunk => {
+			const decodedData = chunk.toString();
+			const tLines = decodedData.split('\n');
+
+			// Parse progress data
+			if (tLines.length > 1) {
+				const findDuration = decodedData.match(durationRegExp);
+				if (findDuration != null) {
+					const cleanDuration = findDuration[0].replace(/Duration\s+:\s+|,/gi, '').trim();
+					duration = convertTimeToMs(cleanDuration);
+				}
+				return;
+			}
+
+			tLines.forEach(line => {
+				// find a space and = in line to parse
+				const isProgress = line.search(/(?=\s)(?=.*=)/g);
+				if (isProgress === -1) {
+					return;
+				}
+				// Cleanup - remove space before and after = and double space
+				const cleanLine = line
+					.trim()
+					.replace(/(\s+)?=(\s+)?/g, '=')
+					.replace(/\s+/g, ' ');
+
+				const splitSpacesAndEquals = cleanLine.split(' ').map(pair => pair.split('='));
+
+				// Convert to object
+				const progressInfo = splitSpacesAndEquals.reduce((acc, infoArray) => {
+					const key = infoArray[0];
+					const value = infoArray[1];
+					acc[key] = value;
+					return acc;
+				}, {});
+				progressInfo.duration = duration;
+
+				// Don't proceed if time is null
+				if (typeof progressInfo.time === 'undefined') {
+					return;
+				}
+
+				const time = convertTimeToMs(progressInfo.time);
+
+				// For trimming stage we have multiple videos
+				// Change duration so max progress is 100
+				if (stage === 'trimming') {
+					let { to, from } = trimDuration;
+					to *= 1000;
+					from *= 1000;
+
+					duration = to - from;
+				}
+
+				if (duration !== null) {
+					progressInfo.progress = parseInt((time / duration) * 100, 10);
+				}
+
+				// Send to backend
+				superagent
+					.post(`${API_ROOT}/video_progress`)
+					.send({
+						video_id: videoId,
+						progress_info: progressInfo
+					})
+					.catch(error => {
+						console.error(error);
+					});
+			});
+		});
+
+		cmd.on('error', err => {
+			console.log('ERROR', err);
+			reject(err);
+		});
+
+		cmd.on('close', code => {
+			if (code === 0) {
+				console.log(`Stage ${stage} completed successfully`);
+				return resolve(resolveObj);
+			}
+			console.log(`An error occured during ${stage} stage`, code);
+			return reject(code);
+		});
+	});
+}
+
+/**
+ * Async function to download video before processing
+ *
+ * @param {string} url Url of the video
+ * @param {obj} videoInfo Details of the video
+ * @returns {obj} Object with video path on success, or error property on failure
+ */
+async function downloadVideo(url, videoInfo) {
+	const { videoName = url, videoId } = videoInfo;
+	const videoExtension = videoName.split('.').pop().toLowerCase();
+	const videoDownloadPath = path.join(
+		__dirname,
+		'videos',
+		`video_${Date.now()}_${parseInt(Math.random() * 10000, 10)}.${videoExtension}`
+	);
+	const cmdArray = ['-y', '-i', url, '-vcodec', 'copy', '-acodec', 'copy', videoDownloadPath];
+	return spawnAsyn(cmdArray, 'downloading', videoId, { videoPath: videoDownloadPath });
+}
+
+/**
+ * Perfom different manipulations on video (disable audio, rotation
+ * and cropping)
+ *
+ * @param {obj} videoInfo Object containing video info
+ * @param {obj} manipulations Type of manipulations to perform
+ * @returns {obj} Promise object
+ */
+async function manipulateVideo({ videoId, videoPath }, manipulations) {
+	const { disable_audio, rotate, crop, trim } = manipulations;
+
+	let cmdArray = [];
+	if (trim !== true) {
+		cmdArray = ['-i', `${videoPath}`, '-c:a', 'copy'];
+	}
+
+	if (disable_audio !== undefined) {
+		cmdArray.push('-an');
+	}
+
+	const videoFilters = [];
+	if (rotate !== undefined) {
+		const rotateTransposeValues = [
+			'transpose=1',
+			'transpose=2,transpose=2',
+			`transpose=${rotate}`,
+			'transpose=4'
+		];
+		videoFilters.push(rotateTransposeValues[rotate]);
+	}
+
+	if (crop !== undefined) {
+		const { out_width, out_height, x_value, y_value } = crop;
+		videoFilters.push(
+			`crop=${out_width / 100}*in_w:${out_height / 100}*in_h:${x_value / 100}*in_w:${
+				y_value / 100
+			}*in_h`
+		);
+	}
+
+	if (videoFilters.length > 0) {
+		cmdArray.push('-vf');
+		cmdArray.push(`${videoFilters.join(',')}`);
+	}
+
+	if (trim !== true) {
+		const videoExtension = videoPath.split('.').pop().toLowerCase();
+		const destination = path.join(__dirname, 'videos', `video-${Date.now()}.${videoExtension}`);
+		cmdArray.push(`${destination}`);
+		return spawnAsyn(cmdArray, 'manipulations', videoId, { newVideoPath: destination });
+	}
+	return cmdArray;
+}
+
+/**
+ * Async function to trim videos as required
+ *
+ * @param {obj} videoInfo Object containing video info
+ * @param {array} trims Array of trim settings
+ * @returns {obj} Promise object
+ */
+async function trimVideos({ videoId, videoPath }, trims, manipulations = null) {
 	const trimsLocations = [];
 	const videoExtension = videoPath.split('.').pop().toLowerCase();
-	let newVideoDuration = 0;
-	let time = 0;
-	let newCurrentTimecode = 0;
 
-	function getTrimmedTime(elem) {
-		return (elem.to - elem.from) * 1000;
-	}
+	const trimVideo = await trims.reduce(async (previousPromise, element) => {
+		await previousPromise;
+		const destination = path.join(
+			__dirname,
+			'videos',
+			`trimmed-video-${Date.now()}.${videoExtension}`
+		);
+		trimsLocations.push(destination);
+		let cmdArray = [
+			'-i',
+			videoPath,
+			'-ss',
+			element.from,
+			'-to',
+			element.to,
+			'-async',
+			1,
+			'-strict',
+			2,
+			destination
+		];
 
-	if (trims.length > 1) {
-		let videoFrom = trims.reduce((from, b) => Math.min(from, b.from), trims[0].from);
-		let videoTo = trims.reduce((to, b) => Math.max(to, b.to), trims[0].to);
+		if (manipulations != null) {
+			// If manipulation exist then remove last element (destination)
+			// Since manipulateVideo function will return that value
+			cmdArray.pop();
 
-		newVideoDuration = (videoTo - videoFrom) * 1000;
-	}
-	else {
-		newVideoDuration = getTrimmedTime(trims[0]);
-	}
-
-	trims.forEach((element,index) => {
-		trimFuncArray.push((callback) => {
-			const videoLocation = path.join(__dirname, `trimmed-video-${Date.now()}.${videoExtension}`);
-			trimsLocations.push(videoLocation);
-			const cmd = spawn('ffmpeg', ['-i', videoPath, '-ss', element.from, '-to', element.to, '-async', 1, '-strict', 2, videoLocation]);
-			const timeRegExp = new RegExp(/time=(\d{2}:\d{2}:\d{2}.\d{2})/);
-
-			cmd.stderr.on('data', (data) => {
-				const decodedData = new Buffer.from(data, 'base64').toString('utf8');
-				if (timeRegExp.test(decodedData)) {
-					if (trims.length === 1 || trims.length > 1 && index === 0) {
-						time = convertTimeToMs(decodedData.match(timeRegExp)[1].split(':'));
-					}
-					if (trims.length > 1 && index > 0) {
-						time = newCurrentTimecode + convertTimeToMs(decodedData.match(timeRegExp)[1].split(':'));
-					}
-					// updateProgressEmit(time, newVideoDuration * taskNum, 'trimming');
-				}
-			});
-			cmd.on('error', (err) => callback(err));
-			cmd.on('close', (code) => {
-				if (code === 0) {
-					console.log("Trimming success");
-					newCurrentTimecode = time;
-					return callback(null, videoLocation);
-				}
-				console.log("Something happened with trimming");
-				return callback(code);
-			});
-		});
-	})
-
-	async.series(trimFuncArray, () => {
-		console.log('mode from trim', mode)
-		return callback(null, trimsLocations, newVideoDuration);
-	})
-}
-
-function concatVideos(videoPaths, videoDuration, currentTimecode, callback) {
-	const videosListFileName = path.join(__dirname, `filelist-${Date.now()}`);
-	videoPaths.forEach((videoLocation) => {
-		fs.appendFileSync(videosListFileName, "file '" + videoLocation + "'\n");
-	})
-
-	const concatedLocation = path.join(__dirname, `concated-video-${Date.now()}.${videoPaths[0].split('.').pop()}`);
-	const cmd = spawn('ffmpeg', ['-f', 'concat', '-safe', 0, '-i', videosListFileName, '-c', 'copy', concatedLocation]);
-	
-	const timeRegExp = new RegExp(/time=(\d{2}:\d{2}:\d{2}.\d{2})/);
-	let newCurrentTimecode = 0;
-
-	cmd.stderr.on('data', (data) => {
-		const decodedData = new Buffer.from(data, 'base64').toString('utf8');
-
-		if (timeRegExp.test(decodedData)) {
-			let time = convertTimeToMs(decodedData.match(timeRegExp)[1].split(':'));
-			newCurrentTimecode = time + currentTimecode;
-			// updateProgressEmit(newCurrentTimecode, videoDuration, 'concating');
+			const addManipulations = await manipulateVideo({}, manipulations);
+			cmdArray = [...cmdArray, ...addManipulations, destination];
 		}
-	});
-	cmd.on('error', (err) => callback(err));
-	cmd.on('close', (code) => {
-		fs.unlink(videosListFileName, () => { });
-		if (code === 0) {
-			console.log("Concating success");
-			return callback(null, concatedLocation, newCurrentTimecode);
-		}
-		console.log("Something happened with concating");
-		return callback(code);
-	});
+
+		return spawnAsyn(cmdArray, 'trimming', videoId, { trimsLocations }, element);
+	}, Promise.resolve());
+
+	return trimVideo;
 }
 
-function rotateVideos(videosPaths, videoDuration, currentTimecode, RotateValue, callback) {
-	const rotatesLocations = [];
-	const rotateFuncArray = [];
-	let newCurrentTimecode = 0;
-	
-	videosPaths.forEach((videoPath) => {
-		rotateFuncArray.push((cb) => {
-			const videoExtension = videoPath.split('.').pop().toLowerCase();
-			const rotatedLocation = path.join(__dirname, `rotated-video-${Date.now()}.${videoExtension}`);
-			rotatesLocations.push(rotatedLocation);
-
-			let commandArguments = [
-				['-i', videoPath, '-vf', 'transpose=1', rotatedLocation],
-				['-i', videoPath, '-vf', 'transpose=2,transpose=2', rotatedLocation],
-				['-i', videoPath, '-vf', `transpose=${RotateValue}`, rotatedLocation],
-				['-i', videoPath, '-vf', 'transpose=4', rotatedLocation]
-			];
-			let cmd;
-
-			switch (RotateValue) {
-				case 0:
-					cmd = spawn('ffmpeg', commandArguments[0]);
-					break;
-				case 1:
-					cmd = spawn('ffmpeg', commandArguments[1]);
-					break;
-				case 2:
-					cmd = spawn('ffmpeg', commandArguments[2]);
-					break;
-				default:
-					cmd = spawn('ffmpeg', commandArguments[3]);
-					break;
-			}
-
-			const timeRegExp = new RegExp(/time=(\d{2}:\d{2}:\d{2}.\d{2})/);
-
-			cmd.stderr.on('data', (data) => {
-				const decodedData = new Buffer.from(data, 'base64').toString('utf8');
-
-				if (timeRegExp.test(decodedData)) {
-					let time = convertTimeToMs(decodedData.match(timeRegExp)[1].split(':'));
-					newCurrentTimecode = time + currentTimecode;
-					// updateProgressEmit(newCurrentTimecode, videoDuration, 'rotating');
-				}
-			});
-			cmd.on('error', (err) => cb(err));
-			cmd.on('close', (code) => {
-				if (code === 0) {
-					console.log("Rotating success");
-					return cb(null);
-				}
-				console.log("Something happened with rotating");
-				return cb(code);
-			});
-		})
-	})
-
-	async.series(rotateFuncArray, (err) => {
-		if (err) return callback(err);
-		return callback(null, rotatesLocations, newCurrentTimecode);
-	})
-}
-
-function cropVideos(videosPaths, videoDuration, currentTimecode, out_width, out_height, x_value, y_value, callback) {
-	const cropsLocations = [];
-	const cropsFuncArray = [];
-	let newCurrentTimecode = 0;
-	videosPaths.forEach((videoPath) => {
-		cropsFuncArray.push((cb) => {
-			const videoExtension = videoPath.split('.').pop().toLowerCase();
-			const croppedLocation = path.join(__dirname, `cropped-video-${Date.now()}.${videoExtension}`);
-			cropsLocations.push(croppedLocation);
-
-			const cmd = spawn('ffmpeg', ['-i', videoPath, '-filter:v', `crop=${out_width / 100}*in_w:${out_height / 100}*in_h:${x_value / 100}*in_w:${y_value / 100}*in_h`, '-c:a', 'copy', croppedLocation]);
-
-			const timeRegExp = new RegExp(/time=(\d{2}:\d{2}:\d{2}.\d{2})/);
-
-			cmd.stderr.on('data', (data) => {
-				const decodedData = new Buffer.from(data, 'base64').toString('utf8');
-
-				if (timeRegExp.test(decodedData)) {
-					let time = convertTimeToMs(decodedData.match(timeRegExp)[1].split(':'));
-					newCurrentTimecode = time + currentTimecode;
-					// updateProgressEmit(newCurrentTimecode, videoDuration, 'cropping');
-				}
-			});
-			cmd.on('error', (err) => {
-				console.log(err)
-				cb(err)
-			});
-			cmd.on('close', (code) => {
-				if (code === 0) {
-					console.log("Cropping success");
-					return cb(null);
-				}
-				console.log("Something happened with cropping");
-				return cb(code);
-			});
-		})
+/**
+ * Concatenate video after trimming (in single mode)
+ *
+ * @param {obj} videoInfo Object containing video info
+ * @returns {obj} Promise object
+ */
+async function concatVideos({ videoId, videoPaths }) {
+	const videosListFileName = path.join(__dirname, 'videos', `filelist-${Date.now()}`);
+	videoPaths.forEach(videoLocation => {
+		fs.appendFileSync(videosListFileName, `file '${videoLocation}'\n`);
 	});
 
-	async.series(cropsFuncArray, (err) => {
-		if (err) return callback(err);
-		return callback(null, cropsLocations, newCurrentTimecode);
-	})
+	const concatedLocation = path.join(
+		__dirname,
+		'videos',
+		`concated-video-${Date.now()}.${videoPaths[0].split('.').pop()}`
+	);
+
+	const cmdArray = [
+		'-f',
+		'concat',
+		'-safe',
+		0,
+		'-i',
+		videosListFileName,
+		'-c',
+		'copy',
+		concatedLocation
+	];
+	return spawnAsyn(cmdArray, 'contacting', videoId, { concatedLocation });
 }
 
-function removeAudioFromVideos(videosPaths, videoDuration, currentTimecode, callback) {
-	const removeAudioFunc = [];
-	const clearedLocations = [];
-	videosPaths.forEach((videoPath) => {
-		removeAudioFunc.push((cb) => {
-			const videoExtension = videoPath.split('.').pop().toLowerCase();
-			const clearedLocation = path.join(__dirname, `cleared-video-${Date.now()}.${videoExtension}`);
-			clearedLocations.push(clearedLocation);
-
-			const cmd = spawn('ffmpeg', ['-i', videoPath, '-c', 'copy', '-an', clearedLocation]);
-
-			const timeRegExp = new RegExp(/time=(\d{2}:\d{2}:\d{2}.\d{2})/);
-
-			cmd.stderr.on('data', (data) => {
-				const decodedData = new Buffer.from(data, 'base64').toString('utf8');
-
-				if (timeRegExp.test(decodedData)) {
-					let time = convertTimeToMs(decodedData.match(timeRegExp)[1].split(':'));
-					// updateProgressEmit(time + currentTimecode, videoDuration, 'losing audio');
-				}
-			});
-			cmd.on('error', (err) => cb(err));
-			cmd.on('close', (code) => {
-				if (code === 0) {
-					console.log("Removing audio success");
-					return cb();
-				}
-				console.log("Something happened with removing audio");
-				return cb(code);
-			});
-		})
-	})
-	async.series(removeAudioFunc, (err) => {
-		if (err) return callback(err);
-		return callback(null, clearedLocations);
-	})
-}
-
-function convertVideoFormat(videoPaths, videoDuration, currentTimecode, callback) {
-	const convertFunc = [];
+/**
+ * Convert video format if not webm or ogv
+ *
+ * @param {obj} videoInfo Object containing video info
+ * @returns {obj} Promise object
+ */
+async function convertVideoFormat({ videoId, videoPaths }) {
+	let videoPathsArray = videoPaths;
+	if (!Array.isArray(videoPaths)) {
+		videoPathsArray = [videoPaths];
+	}
 	const convertedLocations = [];
-	videoPaths.forEach((videoPath) => {
-		convertFunc.push((cb) => {
-			const videoExtension = videoPath.split('.').pop().toLowerCase();
-			if (!(['webm', 'ogv'].includes(videoExtension))) {
-				const convertedLocation = path.join(__dirname, `converted-video-${Date.now()}.webm`);
-				convertedLocations.push(convertedLocation);
+	await videoPathsArray.reduce(async (previousPromise, videoPath) => {
+		await previousPromise;
+		const videoExtension = videoPath.split('.').pop().toLowerCase();
+		if (!['webm', 'ogv'].includes(videoExtension)) {
+			const convertedLocation = path.join(
+				__dirname,
+				'videos',
+				`converted-video-${Date.now()}.webm`
+			);
+			convertedLocations.push(convertedLocation);
+			const cmdArray = [
+				'-i',
+				videoPath,
+				'-c:v',
+				'libvpx-vp9',
+				'-crf',
+				'30',
+				'-b:v',
+				'0',
+				'-b:a',
+				'128k',
+				'-c:a',
+				'libopus',
+				convertedLocation
+			];
+			return spawnAsyn(cmdArray, 'converting', videoId);
+		}
 
-				const timeRegExp = new RegExp(/time=(\d{2}:\d{2}:\d{2}.\d{2})/);
-				const cmd = spawn('ffmpeg', ['-i', videoPath, '-c:v', 'libvpx-vp9', '-crf', '30', '-b:v', '0', '-b:a', '128k', '-c:a', 'libopus', convertedLocation]);
+		console.log('video is already in supported format: ', videoExtension, ', skipping...');
+		const convertedLocation = path.join(
+			__dirname,
+			'videos',
+			`converted-video-${Date.now()}.${videoExtension}`
+		);
+		convertedLocations.push(convertedLocation);
+		try {
+			await fsPromise.rename(videoPath, convertedLocation);
+			return Promise.resolve();
+		} catch (error) {
+			return Promise.reject(error);
+		}
+	}, Promise.resolve());
 
-				cmd.stderr.on('data', (data) => {
-					const decodedData = new Buffer.from(data, 'base64').toString('utf8');
-
-					if (timeRegExp.test(decodedData)) {
-						let time = convertTimeToMs(decodedData.match(timeRegExp)[1].split(':'));
-						// updateProgressEmit(time + currentTimecode, videoDuration, 'converting video format');
-					}
-				});
-				cmd.on('error', (err) => {console.log('err',err);cb(err);})
-				cmd.on('close', (code) => {
-					if (code === 0) {
-						console.log("Converting video format success");
-						return cb();
-					}
-					console.log("Something happened with converting video format");
-					return cb(code);
-				});
-			} else {
-				console.log("video is already in supported format: ", videoExtension, ', skipping...');
-				const convertedLocation = path.join(__dirname, `converted-video-${Date.now()}.${videoExtension}`);
-				fs.rename(videoPath, convertedLocation, function (err) {
-					if (err) {
-						return cb(err.code);
-					}
-					convertedLocations.push(convertedLocation);
-					return cb();
-				});
-			}
-		});
-	});
-	async.series(convertFunc, (err) => {
-		if (err) return callback(err);
-		console.log('converted paths: ')
-		return callback(null, convertedLocations);
-	});
+	return convertedLocations;
 }
 
 module.exports = {
-    move,
-    moveVideosToPublic,
-    deleteFiles,
-    downloadVideo,
-    removeAudioFromVideos,
-    cropVideos,
-    rotateVideos,
-    concatVideos,
+	deleteFiles,
+	downloadVideo,
+	concatVideos,
 	trimVideos,
 	convertVideoFormat,
-	// updateProgressEmit,
-}
+	manipulateVideo
+};
