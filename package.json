@@ -1,11 +1,11 @@
 {
   "name": "video-cut-tool-video-worker",
-  "version": "1.0.0",
-  "description": "",
+  "version": "1.0.1",
+  "description": "Worker for the VideoCutTool",
   "main": "index.js",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1",
-    "start:dev": "nodemon index.js",
+    "test": "echo \"Error: no test specified\"",
+    "start": "node index.js",
     "start:prod": "pm2 start --name cut-tool-worker index.js",
     "stop:prod": "pm2 stop cut-tool-worker "
   },

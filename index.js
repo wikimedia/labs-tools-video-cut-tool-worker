@@ -3,9 +3,9 @@ const superagent = require('superagent');
 const fs = require('fs')
 const async = require('async');
 const utils = require('./utils');
-const config = require('./config');
+const config = require('./config')();
 
-const API_ROOT = 'https://videocuttool.wmflabs.org/video-cut-tool-back-end'
+const API_ROOT = config.API_ROOT;
 const PROCESS_VIDEO_QUEUE = 'PROCESS_VIDEO_QUEUE';
 const PROCESS_VIDEO_PROGRESS_QUEUE = 'PROCESS_VIDEO_PROGRESS_QUEUE';
 const PROCESS_VIDEO_FINISH_QUEUE = 'PROCESS_VIDEO_FINISH_QUEUE';
@@ -86,7 +86,23 @@ function processVideo({ _id, url, videoName, trimVideo, trims, mode, cropVideo, 
                 }, 100);
             });
         }
-        // if the CropVideo is true, 
+        // if the rotateVideo is true, this rotates the video to 90 degree clock-wise
+        // Params: videoPaths, rotateValue
+        if (rotateVideo) {
+          processFuncArray.push((videoPaths, cb) => {
+              console.log('rotating');
+              updateProgress(_id, 'rotating')
+              utils.rotateVideos(videoPaths, endVideoDuration, currentTimecode, rotateValue, (err, rotatedVideos, newCurrentTimecode) => {
+                  utils.deleteFiles(videoPaths);
+                  if (err)
+                      return cb(err);
+                  currentTimecode = newCurrentTimecode;
+                  return cb(null, rotatedVideos);
+              });
+          });
+      }
+
+      // if the CropVideo is true,
         // Params: videoPaths, out_width, out_height, x_value, y_value
         if (cropVideo) {
             processFuncArray.push((videoPaths, cb) => {
@@ -101,21 +117,7 @@ function processVideo({ _id, url, videoName, trimVideo, trims, mode, cropVideo, 
                 });
             });
         }
-        // if the rotateVideo is true, this rotates the video to 90 degree clock-wise
-        // Params: videoPaths, rotateValue
-        if (rotateVideo) {
-            processFuncArray.push((videoPaths, cb) => {
-                console.log('rotating');
-                updateProgress(_id, 'rotating')
-                utils.rotateVideos(videoPaths, endVideoDuration, currentTimecode, rotateValue, (err, rotatedVideos, newCurrentTimecode) => {
-                    utils.deleteFiles(videoPaths);
-                    if (err)
-                        return cb(err);
-                    currentTimecode = newCurrentTimecode;
-                    return cb(null, rotatedVideos);
-                });
-            });
-        }
+
         // Based on the video mode, If single this concatinates the trimmed videos into one.
         // Params: videoPaths
         if (mode === "single" && trims.length > 1) {
